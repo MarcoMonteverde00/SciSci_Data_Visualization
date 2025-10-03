@@ -25,6 +25,20 @@ const svg = container.append("svg")
 const g = svg.append("g")
 	.attr("transform", `translate(${M.left},${M.top})`);
 
+const groupMetricDiv = container.append("div")
+	.attr("id", "groupMetric")
+	.style("position", "absolute")
+	.style("left", "12px")
+	.style("top", "480px")
+	.style("background", "#fff")
+	.style("padding", "8px 12px")
+	.style("border-radius", "8px")
+	.style("box-shadow", "0 8px 22px rgba(2,6,23,0.06)")
+	.style("font-family", "sans-serif")
+	.style("font-size", "12px")
+	.style("z-index", 950)
+	.text(""); // will update dynamically
+
 // Tooltip (styled inline)
 const tooltip = d3.select("body").append("div")
 	.attr("class", "tooltip")
@@ -127,11 +141,18 @@ d3.json("./json/authors.json").then(rawData => {
 
 	// Precompute counts per author for optimization #3
 	authorsRaw.forEach(a => {
-		a._cache = { year: {}, entire: {} };
+		// initialize unified cache object
+		a._cache = {
+			year: {},         // per-year subfield counts (for Force 'year' mode)
+			entire: {},       // cumulative subfield counts up to year (for Force 'entire' mode)
+			sankeyYear: {},   // per-year pair counts (for Sankey 'year' mode)
+			sankeyEntire: {}  // cumulative pair counts up to year (for Sankey 'entire' mode)
+		};
 
-		// 'year' mode
+		// 1) Build subfield counts per year (Force)
+		// a.yearly was set earlier when mapping authorsRaw (a.Yearly_Subfields || {})
 		for (const [yStr, sfObj] of Object.entries(a.yearly || {})) {
-			const y = +yStr;
+			const y = Number(yStr);
 			if (Number.isNaN(y)) continue;
 			a._cache.year[y] = {};
 			for (const [sf, c] of Object.entries(sfObj || {})) {
@@ -139,16 +160,50 @@ d3.json("./json/authors.json").then(rawData => {
 			}
 		}
 
-		// 'entire' cumulative counts
-		const yearsSorted = Object.keys(a.yearly || {}).map(Number).filter(n => !isNaN(n)).sort((a, b) => a - b);
-		let cumulative = {};
-		for (const y of yearsSorted) {
-			const counts = a.yearly[y] || {};
-			cumulative = { ...cumulative };
-			for (const [sf, c] of Object.entries(counts)) cumulative[sf] = (cumulative[sf] || 0) + Number(c || 0);
-			a._cache.entire[y] = { ...cumulative };
+		// Build cumulative 'entire' subfield counts per year
+		{
+			const yearsSorted = Object.keys(a._cache.year).map(Number).filter(n => !isNaN(n)).sort((u, v) => u - v);
+			let running = {};
+			for (const y of yearsSorted) {
+				const counts = a._cache.year[y] || {};
+				for (const [sf, val] of Object.entries(counts)) {
+					running[sf] = (running[sf] || 0) + Number(val || 0);
+				}
+				// store a copy for this year (keyed by numeric year -> will be stringified as object key)
+				a._cache.entire[y] = { ...running };
+			}
 		}
+
+		// 2) Build pair counts per year (Sankey) from a.yearly_fields (a.Yearly_Fields || {})
+		for (const [yStr, pairObj] of Object.entries(a.yearly_fields || {})) {
+			const y = Number(yStr);
+			if (Number.isNaN(y)) continue;
+			a._cache.sankeyYear[y] = {};
+			for (const [pair, v] of Object.entries(pairObj || {})) {
+				a._cache.sankeyYear[y][pair] = Number(v || 0);
+			}
+		}
+
+		// Build cumulative 'entire' pair counts per year for Sankey
+		{
+			const yearsSortedPairs = Object.keys(a._cache.sankeyYear).map(Number).filter(n => !isNaN(n)).sort((u, v) => u - v);
+			let runningPairs = {};
+			for (const y of yearsSortedPairs) {
+				const counts = a._cache.sankeyYear[y] || {};
+				for (const [pair, val] of Object.entries(counts)) {
+					runningPairs[pair] = (runningPairs[pair] || 0) + Number(val || 0);
+				}
+				a._cache.sankeyEntire[y] = { ...runningPairs };
+			}
+		}
+
+		// 3) Backwards compatibility: alias for code that expects a._sankeyPairs
+		a._sankeyPairs = {
+			year: a._cache.sankeyYear,
+			entire: a._cache.sankeyEntire
+		};
 	});
+	// ---- end replacement block ----
 
 	// discover overall year range and possible subfields across dataset
 	const allYearsSet = new Set();
@@ -190,6 +245,32 @@ d3.json("./json/authors.json").then(rawData => {
 			const maxYear = Math.max(...years);
 			return author._cache.entire[maxYear] || {};
 		}
+	}
+
+	// helper: compute interdisciplinary for an author
+	function interdisciplinarity(author, year, mode = mainMode) {
+		const counts = countsFor(author, year, mode);
+		const values = Object.values(counts).map(Number).filter(v => v > 0);
+		if (!values.length) return 0;
+		const maxVal = Math.max(...values);
+		const sumVal = d3.sum(values);
+		return 1 - maxVal / sumVal;
+	}
+
+	// helper: compute group interdisciplinarity (Force/Sankey)
+	function groupInterdisciplinarity(authors, year, mode = mainMode, fieldType = 'subfield') {
+		const aggCounts = {};
+		authors.forEach(a => {
+			const counts = (fieldType === 'subfield') ? countsFor(a, year, mode) : a.yearly_fields?.[String(year)] || {};
+			for (const [key, val] of Object.entries(counts)) {
+				aggCounts[key] = (aggCounts[key] || 0) + Number(val || 0);
+			}
+		});
+		const values = Object.values(aggCounts).filter(v => v > 0);
+		if (!values.length) return 0;
+		const maxVal = Math.max(...values);
+		const sumVal = d3.sum(values);
+		return 1 - maxVal / sumVal;
 	}
 
 	// compute main subfield for an author at year given mode
@@ -325,12 +406,185 @@ d3.json("./json/authors.json").then(rawData => {
 	let showSankey = false; // global flag
 
 	function updateSankey() {
+		// Aggregate pair totals across filteredAuthors using the precomputed author._sankeyPairs
+		const pairTotals = new Map(); // pair -> total count
+
+		for (const author of filteredAuthors) {
+			const sankey = author._sankeyPairs || { year: {}, entire: {} };
+			let pairs = {};
+
+			if (mainMode === 'year') {
+				pairs = sankey.year?.[String(currentYear)] || {};
+			} else { // 'entire' mode: take cumulative up to currentYear from author's precomputed cumulative map
+				const years = Object.keys(sankey.entire || {}).map(Number).filter(y => !isNaN(y) && y <= currentYear);
+				if (years.length) {
+					const yy = Math.max(...years);
+					pairs = sankey.entire[yy] || {};
+				} else {
+					pairs = {};
+				}
+			}
+
+			for (const [pair, val] of Object.entries(pairs || {})) {
+				const v = Number(val || 0);
+				if (v <= 0) continue;
+				pairTotals.set(pair, (pairTotals.get(pair) || 0) + v);
+			}
+		}
+
+		// nothing to draw -> clear sankey visuals and return
+		if (!pairTotals.size) {
+			sankeyLayer.selectAll("*").remove();
+			phantomLayer.selectAll("*").remove();
+			g.selectAll(".sankeyLabelLayer").remove();
+			return;
+		}
+
+		// Build links and nodes
+		const links = [];
+		const nodesSet = new Set();
+
+		for (const [pair, count] of pairTotals.entries()) {
+			const parts = String(pair).split('---');
+			if (parts.length < 2) continue;
+			const subfield = parts[0];
+			const field = parts[1];
+			links.push({ source: subfield, target: field, value: count });
+			nodesSet.add(subfield);
+			nodesSet.add(field);
+		}
+
+		if (!links.length) {
+			sankeyLayer.selectAll("*").remove();
+			phantomLayer.selectAll("*").remove();
+			g.selectAll(".sankeyLabelLayer").remove();
+			return;
+		}
+
+		const nodes = Array.from(nodesSet).map(name => ({ name }));
+		const nameToIndex = new Map(nodes.map((d, i) => [d.name, i]));
+		const sankeyLinks = links.map(l => ({
+			source: nameToIndex.get(l.source),
+			target: nameToIndex.get(l.target),
+			value: l.value
+		}));
+
+		// Sankey layout area
+		const leftMargin = 200;
+		const rightEdge = innerW - 50;
+		const sankeyWidth = rightEdge - leftMargin;
+		const sankeyHeight = innerH - 50;
+
+		const sankeyGen = d3.sankey()
+			.nodeWidth(20)
+			.nodePadding(10)
+			.extent([[leftMargin, 20], [rightEdge, sankeyHeight]]);
+
+		// Run layout (give fresh plain objects so d3 can mutate them)
+		const graph = sankeyGen({
+			nodes: nodes.map(d => Object.assign({}, d)),
+			links: sankeyLinks.map(d => Object.assign({}, d))
+		});
+
+		// remove old defs (we recreate gradients); do not remove whole sankeyLayer to allow joins
+		sankeyLayer.select("defs").remove();
+		phantomLayer.selectAll("*").remove(); // keep behavior from original
+		g.selectAll(".sankeyLabelLayer").remove(); // remove older labels (we'll recreate)
+
+		const defs = sankeyLayer.append("defs");
+
+		// LINKS: keyed by sourceName->targetName to avoid full DOM churn
+		const linkKey = d => `${d.source.name}->${d.target.name}`;
+		const linkSel = sankeyLayer.selectAll("path.sankey-link").data(graph.links, linkKey);
+
+		linkSel.join(
+			enter => enter.append("path")
+				.attr("class", "sankey-link")
+				.attr("fill", "none")
+				.attr("opacity", 0.8),
+			update => update,
+			exit => exit.remove()
+		)
+			.attr("d", d3.sankeyLinkHorizontal())
+			.attr("stroke-width", d => Math.max(1, d.width))
+			.attr("stroke", d => {
+				// create stable id per pair (sanitized)
+				const safe = s => String(s).replace(/\W+/g, "_").replace(/^_+|_+$/g, "");
+				const gradId = `grad_${safe(d.source.name)}__${safe(d.target.name)}`;
+				// avoid duplicate defs for same id (we already removed defs at top of function)
+				const gradient = defs.append("linearGradient")
+					.attr("id", gradId)
+					.attr("gradientUnits", "userSpaceOnUse")
+					.attr("x1", d.source.x1)
+					.attr("y1", (d.y0 + d.y1) / 2)
+					.attr("x2", d.target.x0)
+					.attr("y2", (d.y0 + d.y1) / 2);
+
+				gradient.append("stop")
+					.attr("offset", "0%")
+					.attr("stop-color", colorScale(d.source.name) || "#888");
+
+				gradient.append("stop")
+					.attr("offset", "100%")
+					.attr("stop-color", colorScale(d.target.name) || "#888");
+
+				return `url(#${gradId})`;
+			})
+			.attr("fill", "none")
+			.attr("opacity", 0.8);
+
+		// NODES: keyed by name
+		const nodeSel = sankeyLayer.selectAll("rect.sankey-node").data(graph.nodes, d => d.name);
+		nodeSel.join(
+			enter => enter.append("rect").attr("class", "sankey-node").attr("stroke", "#000"),
+			update => update,
+			exit => exit.remove()
+		)
+			.attr("x", d => d.x0)
+			.attr("y", d => d.y0)
+			.attr("width", d => d.x1 - d.x0)
+			.attr("height", d => d.y1 - d.y0)
+			.attr("fill", d => colorScale(d.name) || "#888");
+
+		// LABELS: new layer under sankeyLayer so it rotates/moves consistently
+		const labelLayer = sankeyLayer.append("g").attr("class", "sankeyLabelLayer");
+		labelLayer.selectAll("text.sankey-label")
+			.data(graph.nodes, d => d.name)
+			.join("text")
+			.attr("class", "sankey-label")
+			.attr("x", d => d.x0 < sankeyWidth / 2 ? d.x1 + 4 : d.x0 - 4)
+			.attr("y", d => (d.y1 + d.y0) / 2)
+			.attr("text-anchor", d => d.x0 < sankeyWidth / 2 ? "start" : "end")
+			.attr("alignment-baseline", "middle")
+			.style("font-family", "sans-serif")
+			.style("font-size", "12px")
+			.text(d => d.name);
+	}
+
+
+	/*
+	function updateSankey() {
 		const links = [];
 		filteredAuthors.forEach(author => {
-			const yearly = author.yearly_fields || {}; // <-- use yearly_fields
-			const yearStr = String(currentYear);
-			const dataYear = yearly[yearStr] || {};
-			for (const [pair, count] of Object.entries(dataYear)) {
+			let countsByPair = {}; // { "subfield---field": value }
+
+			if (mainMode === 'year') {
+				const dataYear = author.yearly_fields?.[String(currentYear)] || {};
+				countsByPair = dataYear;
+			} else { // 'entire' mode: cumulative up to currentYear
+				const yearsSorted = Object.keys(author.yearly_fields || {})
+					.map(Number).filter(y => !isNaN(y)).sort((a, b) => a - b);
+
+				let cumulative = {};
+				for (const y of yearsSorted) {
+					if (y > currentYear) break;
+					const counts = author.yearly_fields[y] || {};
+					for (const [pair, val] of Object.entries(counts)) cumulative[pair] = (cumulative[pair] || 0) + Number(val || 0);
+				}
+				countsByPair = cumulative;
+			}
+
+			for (const [pair, count] of Object.entries(countsByPair)) {
 				const [subfield, field] = pair.split('---');
 				if (subfield && field) links.push({ source: subfield, target: field, value: count });
 			}
@@ -432,6 +686,7 @@ d3.json("./json/authors.json").then(rawData => {
 			.style("font-size", "12px")
 			.text(d => d.name);
 	}
+	*/
 
 	// -------------------------------------------------------------------------------------------------------------------------
 	// -------------------------------------------------------------------------------------------------------------------------
@@ -744,6 +999,7 @@ d3.json("./json/authors.json").then(rawData => {
 		const tooltipHtml = (d, svg) => `
 		<div style="font-weight:700">${escapeHTML(d.author.name)}</div>
 		<div style="margin-top:6px"><b>Main subfield: </b>${escapeHTML(d.subfield)}</div>
+		<div style="margin-top:6px"><b>Interdisciplinarity:</b> ${(interdisciplinarity(d.author, currentYear, mainMode) * 100).toFixed(1)}%</div>
 		<div style="margin-top:12px"><b>Subfields Occurrences</b> (${mainMode === 'entire' ? 'up to' : 'in'} ${currentYear}):</div>
 		<div style="margin:6px 0 0 0;position:relative">${svg}</div>`;
 
@@ -754,6 +1010,7 @@ d3.json("./json/authors.json").then(rawData => {
 			return `<div style="display:flex;justify-content:space-between;align-items:center"><h2 style="margin:0">${escapeHTML(d.author.name)}</h2></div>
 		<div style="margin-top:10px"><b>Institution:</b> ${escapeHTML(d.author.institution || "—")}</div>
 		<div style="margin-top:6px"><b>Main subfield:</b> ${escapeHTML(d.subfield)}</div>
+		<div style="margin-top:6px"><b>Interdisciplinarity:</b> ${(interdisciplinarity(d.author, currentYear, mainMode) * 100).toFixed(1)}%</div>
 		<div style="margin-top:10px"><b>Metrics</b><ul style="margin:6px 0 0 18px;padding:0">
 			<li>H-Index: ${isNaN(d.author.hindex) ? "—" : d.author.hindex}</li>
 			<li>I10-Index: ${isNaN(d.author.i10index) ? "—" : d.author.i10index}</li>
@@ -855,6 +1112,18 @@ d3.json("./json/authors.json").then(rawData => {
 		updateNodeSelection();
 		updateClustersAndLabels();
 		updatePhantoms();
+		if (showSankey) {
+			updateSankey();
+		}
+
+		// Update group interdisciplinarity display
+		if (showSankey) {
+			const val = groupInterdisciplinarity(filteredAuthors, currentYear, mainMode, 'external');
+			groupMetricDiv.html(`<b>Outer Interdisciplinarity:</b><br><b style="font-size: 24px; padding-left: 32px;">${(val * 100).toFixed(1)}%</b>`);
+		} else {
+			const val = groupInterdisciplinarity(filteredAuthors, currentYear, mainMode, 'subfield');
+			groupMetricDiv.html(`<b>Inner Interdisciplinarity:</b><br><b style="font-size: 24px; padding-left: 30px;">${(val * 100).toFixed(1)}%</b>`);
+		}
 
 		// animate if asked
 		if (animate) simulation.alpha(0.8).restart();
@@ -941,6 +1210,15 @@ d3.json("./json/authors.json").then(rawData => {
 			g.selectAll(".sankeyLabelLayer").remove();
 
 			setYear(currentYear, forceRestart);
+		}
+
+		// Update group interdisciplinarity display
+		if (showSankey) {
+			const val = groupInterdisciplinarity(filteredAuthors, currentYear, mainMode, 'external');
+			groupMetricDiv.html(`<b>Outer Interdisciplinarity</b><br><b style="font-size: 24px; padding-left: 32px;"> ${(val * 100).toFixed(1)}%</b>`);
+		} else {
+			const val = groupInterdisciplinarity(filteredAuthors, currentYear, mainMode, 'subfield');
+			groupMetricDiv.html(`<b>Inner Interdisciplinarity</b><br><b style="font-size: 24px; padding-left: 30px;"> ${(val * 100).toFixed(1)}%</b>`);
 		}
 	}
 
