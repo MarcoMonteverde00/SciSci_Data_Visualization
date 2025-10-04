@@ -765,18 +765,54 @@ d3.json("./json/authors.json").then(rawData => {
 		.attr("fill", "#0f172a")
 		.text(currentYear);
 
-	// Autoplay button (right of slider)
-	const playX = innerW - 30;
-	const playBtn = sliderG.append("g").attr("transform", `translate(${playX}, 0)`).style("cursor", "pointer");
-	playBtn.append("rect").attr("x", -22).attr("y", -22).attr("width", 44).attr("height", 44).attr("rx", 8).attr("fill", "#2563eb");
-	const playIcon = playBtn.append("text").attr("text-anchor", "middle").attr("alignment-baseline", "middle").attr("fill", "#fff").attr("font-size", "18px").text("▶");
+	// Autoplay button (left of slider)
+	const playX = 10; // slight padding
+	const playBtn = sliderG.append("g")
+		.attr("transform", `translate(${playX}, 0)`)
+		.style("cursor", "pointer");
+
+	// Circle background
+	playBtn.append("circle")
+		.attr("r", 20)
+		.attr("fill", "url(#playGradient)")
+		.style("filter", "drop-shadow(0px 2px 4px rgba(0,0,0,0.2))");
+
+	// Define gradient for nicer look
+	const defs = sliderG.append("defs");
+	const gradient = defs.append("linearGradient")
+		.attr("id", "playGradient")
+		.attr("x1", "0%").attr("y1", "0%")
+		.attr("x2", "100%").attr("y2", "100%");
+	gradient.append("stop").attr("offset", "0%").attr("stop-color", "#3b82f6");
+	gradient.append("stop").attr("offset", "100%").attr("stop-color", "#2563eb");
+
+	// Define icon shapes
+	const playPath = "M-5,-8 L10,0 L-5,8 Z"; // triangle
+	const pausePath = "M-8,-8 H-2 V8 H-8 Z M2,-8 H8 V8 H2 Z"; // two bars
+
+	// Add play icon
+	const playIcon = playBtn.append("path")
+		.attr("d", playPath)
+		.attr("fill", "#fff");
+
+	// Hover effect: scale slightly
+	playBtn.on("mouseenter", function () {
+		d3.select(this).transition().duration(200)
+			.attr("transform", `translate(${playX}, 0) scale(1.1)`);
+	}).on("mouseleave", function () {
+		d3.select(this).transition().duration(200)
+			.attr("transform", `translate(${playX}, 0) scale(1)`);
+	});
 
 	let autoplay = false;
 	let autoplayInterval = null;
 
 	playBtn.on("click", () => {
 		autoplay = !autoplay;
-		playIcon.text(autoplay ? "⏸" : "▶");
+
+		// Transition icon shape
+		playIcon.transition().duration(200)
+			.attr("d", autoplay ? pausePath : playPath);
 
 		if (autoplay) {
 			if (!autoplayInterval) {
@@ -793,6 +829,7 @@ d3.json("./json/authors.json").then(rawData => {
 			}
 		}
 	});
+
 
 	// Drag anywhere on sliderG
 	sliderG.call(d3.drag().on("start drag", (event) => {

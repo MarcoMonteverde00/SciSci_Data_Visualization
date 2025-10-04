@@ -33,7 +33,7 @@ export const colorScale = d3.scaleOrdinal()
     ]);
 
 // General Visualization Dimensions
-export const W = 1120, H = 760;
+export const W = 1120, H = 960;
 export const M = { top: 30, right: 20, bottom: 140, left: 20 };
 export const innerW = W - M.left - M.right;
 export const innerH = H - M.top - M.bottom;
