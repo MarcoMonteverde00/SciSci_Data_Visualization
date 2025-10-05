@@ -247,6 +247,23 @@ d3.json("./json/authors.json").then(rawData => {
 		}
 	}
 
+	function countsForFields(author, year, mode) {
+		const yearlyFields = author.Yearly_Fields || author.yearly_fields || {};
+		if (mode === "year") {
+			return yearlyFields[String(year)] || {};
+		} else if (mode === "entire") {
+			const agg = {};
+			for (const [y, pairs] of Object.entries(yearlyFields)) {
+				if (+y > year) continue;
+				for (const [pair, val] of Object.entries(pairs)) {
+					agg[pair] = (agg[pair] || 0) + val;
+				}
+			}
+			return agg;
+		}
+		return {};
+	}
+
 	// helper: compute interdisciplinary for an author
 	function interdisciplinarity(author, year, mode = mainMode) {
 		const counts = countsFor(author, year, mode);
@@ -261,7 +278,9 @@ d3.json("./json/authors.json").then(rawData => {
 	function groupInterdisciplinarity(authors, year, mode = mainMode, fieldType = 'subfield') {
 		const aggCounts = {};
 		authors.forEach(a => {
-			const counts = (fieldType === 'subfield') ? countsFor(a, year, mode) : a.yearly_fields?.[String(year)] || {};
+			const counts = (fieldType === 'subfield')
+				? countsFor(a, year, mode)
+				: countsForFields(a, year, mode);
 			for (const [key, val] of Object.entries(counts)) {
 				aggCounts[key] = (aggCounts[key] || 0) + Number(val || 0);
 			}
@@ -560,133 +579,6 @@ d3.json("./json/authors.json").then(rawData => {
 			.style("font-size", "12px")
 			.text(d => d.name);
 	}
-
-
-	/*
-	function updateSankey() {
-		const links = [];
-		filteredAuthors.forEach(author => {
-			let countsByPair = {}; // { "subfield---field": value }
-
-			if (mainMode === 'year') {
-				const dataYear = author.yearly_fields?.[String(currentYear)] || {};
-				countsByPair = dataYear;
-			} else { // 'entire' mode: cumulative up to currentYear
-				const yearsSorted = Object.keys(author.yearly_fields || {})
-					.map(Number).filter(y => !isNaN(y)).sort((a, b) => a - b);
-
-				let cumulative = {};
-				for (const y of yearsSorted) {
-					if (y > currentYear) break;
-					const counts = author.yearly_fields[y] || {};
-					for (const [pair, val] of Object.entries(counts)) cumulative[pair] = (cumulative[pair] || 0) + Number(val || 0);
-				}
-				countsByPair = cumulative;
-			}
-
-			for (const [pair, count] of Object.entries(countsByPair)) {
-				const [subfield, field] = pair.split('---');
-				if (subfield && field) links.push({ source: subfield, target: field, value: count });
-			}
-		});
-
-		if (!links.length) return; // nothing to draw
-
-		const nodesSet = new Set();
-		links.forEach(l => { nodesSet.add(l.source); nodesSet.add(l.target); });
-		const nodes = Array.from(nodesSet).map(name => ({ name }));
-
-		const nameToIndex = new Map(nodes.map((d, i) => [d.name, i]));
-		const sankeyLinks = links.map(l => ({
-			source: nameToIndex.get(l.source),
-			target: nameToIndex.get(l.target),
-			value: l.value
-		}));
-
-		// Clear previous layers
-		sankeyLayer.selectAll("*").remove();          // clear previous sankey elements
-		phantomLayer.selectAll("*").remove();         // optional, clear phantoms
-		g.selectAll(".sankeyLabelLayer").remove();    // remove old sankey labels
-
-		// Sankey layout: it starts de-centered to avoid being overlapped by UI
-		const leftMargin = 200;
-		const rightEdge = innerW - 50;
-		const sankeyWidth = rightEdge - leftMargin;
-		const sankeyHeight = innerH - 50;
-
-		const sankeyGen = d3.sankey()
-			.nodeWidth(20)
-			.nodePadding(10)
-			.extent([[leftMargin, 20], [rightEdge, sankeyHeight]]);
-
-		const graph = sankeyGen({
-			nodes: nodes.map(d => Object.assign({}, d)),
-			links: sankeyLinks.map(d => Object.assign({}, d))
-		});
-
-		console.log("Sankey nodes:", graph.nodes);
-		console.log("Sankey links:", graph.links);
-
-		// Create defs for gradients
-		const defs = sankeyLayer.append("defs");
-
-		sankeyLayer.selectAll("path.sankey-link")
-			.data(graph.links)
-			.join("path")
-			.attr("class", "sankey-link")
-			.attr("d", d3.sankeyLinkHorizontal())
-			.attr("stroke", d => {
-				// create unique id per link
-				const gradId = `grad-${d.index}`;
-				const gradient = defs.append("linearGradient")
-					.attr("id", gradId)
-					.attr("gradientUnits", "userSpaceOnUse")
-					.attr("x1", d.source.x1)
-					.attr("y1", (d.y0 + d.y1) / 2)
-					.attr("x2", d.target.x0)
-					.attr("y2", (d.y0 + d.y1) / 2);
-
-				gradient.append("stop")
-					.attr("offset", "0%")
-					.attr("stop-color", colorScale(d.source.name) || "#888");
-
-				gradient.append("stop")
-					.attr("offset", "100%")
-					.attr("stop-color", colorScale(d.target.name) || "#888");
-
-				return `url(#${gradId})`;
-			})
-			.attr("stroke-width", d => Math.max(1, d.width))
-			.attr("fill", "none")
-			.attr("opacity", 0.8);
-
-		// Draw nodes into sankeyLayer as well
-		sankeyLayer.selectAll("rect.sankey-node")
-			.data(graph.nodes)
-			.join("rect")
-			.attr("class", "sankey-node")
-			.attr("x", d => d.x0)
-			.attr("y", d => d.y0)
-			.attr("width", d => d.x1 - d.x0)
-			.attr("height", d => d.y1 - d.y0)
-			.attr("fill", d => colorScale(d.name) || "#888")
-			.attr("stroke", "#000")
-
-		// Labels
-		const labelLayer = sankeyLayer.append("g").attr("class", "sankeyLabelLayer");
-		labelLayer.selectAll("text.sankey-label")
-			.data(graph.nodes)
-			.join("text")
-			.attr("class", "sankey-label")
-			.attr("x", d => d.x0 < sankeyWidth / 2 ? d.x1 + 4 : d.x0 - 4)
-			.attr("y", d => (d.y1 + d.y0) / 2)
-			.attr("text-anchor", d => d.x0 < sankeyWidth / 2 ? "start" : "end")
-			.attr("alignment-baseline", "middle")
-			.style("font-family", "sans-serif")
-			.style("font-size", "12px")
-			.text(d => d.name);
-	}
-	*/
 
 	// -------------------------------------------------------------------------------------------------------------------------
 	// -------------------------------------------------------------------------------------------------------------------------
